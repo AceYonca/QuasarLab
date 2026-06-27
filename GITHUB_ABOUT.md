@@ -5,13 +5,13 @@ Use this content in the GitHub repository sidebar and settings.
 ## Description
 
 ```text
-Windows WPF protocol workbench for Quasar-compatible lab traffic: profile-driven TLS connections, protobuf framing, message logs, and packet inspection for authorized research.
+Windows WPF lab tool for checking Quasar-compatible servers, adding test clients, monitoring connections, and inspecting protocol traffic.
 ```
 
-## Website
+## Website / Demo
 
 ```text
-Leave blank unless you publish documentation, a release page, or a demo video.
+https://www.youtube.com/watch?v=CHZI1-WL4Ds
 ```
 
 ## Topics
@@ -34,7 +34,7 @@ lab-tooling
 ## Short Pitch
 
 ```text
-QuasarLab gives protocol researchers a focused Windows desktop workbench for controlled Quasar-compatible traffic: configure lab identities, connect over TLS, observe protobuf-framed messages, and inspect packet details without leaving the app.
+QuasarLab helps researchers test Quasar-compatible servers in a private lab by checking server reachability, adding test clients, monitoring reconnect behavior, and inspecting TLS/protobuf traffic.
 ```
 
 ## Public Repo Note
