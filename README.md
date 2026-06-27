@@ -1,6 +1,6 @@
 # QuasarLab
 
-QuasarLab is a Windows WPF lab tool for testing Quasar-compatible servers in a controlled environment.
+QuasarLab is a Windows WPF lab tool for testing Quasar-RAT servers in a controlled environment.
 
 It helps you check if a target test server is online, connect one or more lab clients, monitor connection status, inspect packet traffic, and review message logs.
 
