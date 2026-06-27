@@ -10,6 +10,9 @@ It helps you check if a target test server is online, connect one or more lab cl
 
 [Watch the demonstration video](https://www.youtube.com/watch?v=CHZI1-WL4Ds)
 
+<img width="1219" height="754" alt="image" src="https://github.com/user-attachments/assets/9416eec6-56f5-44c7-abfd-10fedecc8856" />
+
+
 ## Features
 
 - Check if a target test server is reachable.
