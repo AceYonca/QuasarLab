@@ -38,32 +38,6 @@ It helps you check if a target test server is online, connect one or more lab cl
 
 Open `QuasarLab.sln` in Visual Studio and build the solution.
 
-Or build from a Visual Studio Developer PowerShell:
-
-```powershell
-MSBuild.exe QuasarLab\QuasarLab.csproj /p:Configuration=Release
-```
-
-The output will be here:
-
-```text
-QuasarLab\bin\Release\QuasarLab.exe
-```
-
-## GitHub About
-
-Suggested repository description:
-
-```text
-Windows WPF lab tool for checking Quasar-compatible servers, adding test clients, monitoring connections, and inspecting protocol traffic.
-```
-
-Suggested topics:
-
-```text
-csharp, wpf, windows, dotnet-framework, protobuf-net, tls, packet-inspection, protocol-analysis, reverse-engineering, malware-analysis, security-research, lab-tooling
-```
-
 ## Responsible Use
 
 QuasarLab is made for research, QA, and private lab testing. Do not use it on servers, systems, or networks without permission.
