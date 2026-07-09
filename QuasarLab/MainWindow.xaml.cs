@@ -24,8 +24,8 @@ namespace QuasarLab
         private const int MaxLogLines = 1000;
         private const int MaxPacketEntries = 500;
         private const int ServerMonitorIntervalMs = 3000;
-        private const int ServerMonitorTimeoutMs = 800;
-
+        private const int ServerMonitorTimeoutMs = 1500;
+        
         private ClientProfile _profile;
         private int _packetSequence;
         private bool _serverAvailable;
@@ -34,7 +34,7 @@ namespace QuasarLab
         private bool _autoReconnectRunning;
         private bool _spawnRunning;
         private bool _shuttingDown;
-
+        private const int MaxVisibleConnections = 500;
         public MainWindow()
         {
             InitializeComponent();
@@ -59,36 +59,87 @@ namespace QuasarLab
 
         private void RefreshConnectionsList()
         {
-            Dispatcher.Invoke(() =>
+            if (!Dispatcher.CheckAccess())
             {
-                DashboardConnectionsList.Items.Clear();
-                ConnectionsManagerList.Items.Clear();
+                Dispatcher.BeginInvoke(
+                    new Action(RefreshConnectionsList));
 
-                var connections = _service.Connections.ToList();
+                return;
+            }
 
-                if (connections.Count == 0)
-                {
-                    AddConnectionListEntry(new ConnectionListEntry
+            var allConnections =
+                _service.Connections;
+
+            DashboardConnectionsList.Items.Clear();
+            ConnectionsManagerList.Items.Clear();
+
+            if (allConnections.Count == 0)
+            {
+                AddConnectionListEntry(
+                    new ConnectionListEntry
                     {
                         DisplayText = "No active connections",
                         IsConnection = false
                     });
 
-                    return;
-                }
+                return;
+            }
 
-                foreach (var c in connections)
-                {
-                    string item = "#" + c.Index + " | " + c.PcName + " | " + c.Username + " | " + c.Status;
+            int visibleCount =
+                Math.Min(
+                    allConnections.Count,
+                    MaxVisibleConnections);
 
-                    AddConnectionListEntry(new ConnectionListEntry
+            int hiddenCount =
+                allConnections.Count -
+                visibleCount;
+
+            if (hiddenCount > 0)
+            {
+                AddConnectionListEntry(
+                    new ConnectionListEntry
+                    {
+                        DisplayText =
+                            "Showing newest " +
+                            visibleCount +
+                            " of " +
+                            allConnections.Count +
+                            " connections",
+                        IsConnection = false
+                    });
+            }
+
+            int startIndex =
+                Math.Max(
+                    0,
+                    allConnections.Count -
+                    MaxVisibleConnections);
+
+            for (int i = startIndex;
+                 i < allConnections.Count;
+                 i++)
+            {
+                var c =
+                    allConnections[i];
+
+                string item =
+                    "#" +
+                    c.Index +
+                    " | " +
+                    c.PcName +
+                    " | " +
+                    c.Username +
+                    " | " +
+                    c.Status;
+
+                AddConnectionListEntry(
+                    new ConnectionListEntry
                     {
                         Index = c.Index,
                         DisplayText = item,
                         IsConnection = true
                     });
-                }
-            });
+            }
         }
 
         private void AddConnectionListEntry(ConnectionListEntry entry)
@@ -110,7 +161,9 @@ namespace QuasarLab
             RefreshConnectionsList();
         }
 
-        private async void StartSpawnerButton_Click(object sender, RoutedEventArgs e)
+        private async void StartSpawnerButton_Click(
+        object sender,
+        RoutedEventArgs e)
         {
             if (_spawnRunning)
                 return;
@@ -124,23 +177,31 @@ namespace QuasarLab
             int interval = ParseInt(ConnectIntervalBox.Text, 1);
             bool unlimited = UnlimitedConnectCheckBox.IsChecked == true;
 
+            if (amount < 1)
+                amount = 1;
+
             if (interval < 1)
                 interval = 1;
 
             AddLog("Spawner started.");
 
             int created = 0;
-            int refreshEvery = 25;
 
             try
             {
-                while (_spawnRunning)
+                while (_spawnRunning && !_shuttingDown)
                 {
-                    if (!_serverAvailable &&
-                        !await EnsureServerReadyAsync("Spawner"))
-                        break;
+                    if (!_serverAvailable)
+                    {
+                        bool ready =
+                            await EnsureServerReadyAsync("Spawner");
 
-                    var result = await _service.ConnectOneAsync();
+                        if (!ready)
+                            break;
+                    }
+
+                    var result =
+                        await _service.ConnectOneAsync();
 
                     if (result != null)
                     {
@@ -148,34 +209,64 @@ namespace QuasarLab
                     }
                     else
                     {
-                        bool alive = await _service.CheckServerAsync(ServerMonitorTimeoutMs);
-                        ApplyServerAvailability(alive, true);
+                        bool alive =
+                            await _service.CheckServerAsync(
+                                ServerMonitorTimeoutMs,
+                                false);
+
+                        ApplyServerAvailability(
+                            alive,
+                            true);
 
                         if (!alive)
                             break;
                     }
 
-                    if (created % refreshEvery == 0)
+                    int refreshEvery =
+                        _service.UiUpdateEvery;
+
+                    if (created > 0 &&
+                        created % refreshEvery == 0)
                     {
                         RefreshConnectionsList();
-                        SetStatus(_service.Connections.Count + " connected");
+
+                        int connected =
+                            _service.Connections.Count(c =>
+                                string.Equals(
+                                    c.Status,
+                                    "Connected",
+                                    StringComparison.Ordinal));
+
+                        SetStatus(
+                            connected +
+                            " connected");
                     }
 
-                    if (!unlimited && created >= amount)
+                    if (!unlimited &&
+                        created >= amount)
+                    {
                         break;
+                    }
 
                     await Task.Delay(interval);
                 }
             }
             catch (Exception ex)
             {
-                AddLog("Spawner error: " + ex.Message);
+                AddLog(
+                    "Spawner error: " +
+                    ex.Message);
             }
+            finally
+            {
+                _spawnRunning = false;
 
-            RefreshConnectionsList();
+                RefreshConnectionsList();
 
-            _spawnRunning = false;
-            AddLog("Spawner stopped. Created: " + created);
+                AddLog(
+                    "Spawner stopped. Created: " +
+                    created);
+            }
         }
 
         private void StopSpawnerButton_Click(object sender, RoutedEventArgs e)
@@ -482,10 +573,26 @@ namespace QuasarLab
             {
                 while (!_shuttingDown)
                 {
-                    bool alive = await _service.CheckServerAsync(ServerMonitorTimeoutMs);
-                    ApplyServerAvailability(alive, true);
+                    bool alive =
+                        await _service.CheckServerAsync(
+                            ServerMonitorTimeoutMs,
+                            false);
 
-                    await Task.Delay(ServerMonitorIntervalMs);
+                    ApplyServerAvailability(
+                        alive,
+                        true);
+
+                    await Task.Delay(
+                        ServerMonitorIntervalMs);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!_shuttingDown)
+                {
+                    AddLog(
+                        "Server monitor error: " +
+                        ex.Message);
                 }
             }
             finally
@@ -494,20 +601,29 @@ namespace QuasarLab
             }
         }
 
-        private async Task<bool> EnsureServerReadyAsync(string action)
+        private async Task<bool> EnsureServerReadyAsync(
+           string action)
         {
-            bool alive = await _service.CheckServerAsync(ServerMonitorTimeoutMs);
-            ApplyServerAvailability(alive, true);
+            bool alive =
+                await _service.CheckServerAsync(
+                    ServerMonitorTimeoutMs,
+                    false);
+
+            ApplyServerAvailability(
+                alive,
+                true);
 
             if (!alive)
             {
-                AddLog(action + " blocked: server is offline.");
+                AddLog(
+                    action +
+                    " blocked: TLS server check failed.");
+
                 return false;
             }
 
             return true;
         }
-
         private void MarkServerChecking()
         {
             _serverStatusKnown = false;
@@ -521,12 +637,26 @@ namespace QuasarLab
             });
         }
 
-        private void ApplyServerAvailability(bool available, bool logChanges)
+        private void ApplyServerAvailability(
+      bool available,
+      bool logChanges)
         {
-            bool changed = !_serverStatusKnown || _serverAvailable != available;
+            bool changed =
+                !_serverStatusKnown ||
+                _serverAvailable != available;
 
             _serverStatusKnown = true;
             _serverAvailable = available;
+
+            // Refresh actual per-connection socket states first.
+            _service.RefreshDeadConnections();
+
+            int connected =
+                _service.Connections.Count(c =>
+                    string.Equals(
+                        c.Status,
+                        "Connected",
+                        StringComparison.Ordinal));
 
             Dispatcher.Invoke(() =>
             {
@@ -534,33 +664,40 @@ namespace QuasarLab
 
                 if (available)
                 {
-                    int connected = _service.Connections.Count;
-                    StatusText.Text = connected > 0
-                        ? connected + " connected"
-                        : "Server listening";
-                    StatusText.Foreground = GetBrush("SuccessBrush");
+                    StatusText.Text =
+                        connected > 0
+                            ? connected + " connected"
+                            : "Server listening";
+
+                    StatusText.Foreground =
+                        GetBrush("SuccessBrush");
                 }
                 else
                 {
-                    StatusText.Text = "Server offline";
-                    StatusText.Foreground = GetBrush("DangerBrush");
+                    StatusText.Text =
+                        connected > 0
+                            ? connected +
+                              " connected | server check failed"
+                            : "Server offline";
 
-                    _service.MarkAllConnectionsDisconnected();
-                    RefreshConnectionsList();
+                    StatusText.Foreground =
+                        GetBrush("DangerBrush");
 
                     if (_spawnRunning)
                         _spawnRunning = false;
                 }
             });
 
+            RefreshConnectionsList();
+
             if (logChanges && changed)
             {
-                AddLog(available
-                    ? "Server monitor: target is online."
-                    : "Server monitor: target is offline.");
+                AddLog(
+                    available
+                        ? "Server monitor: TLS health check succeeded."
+                        : "Server monitor: TLS health check failed.");
             }
         }
-
         private void SetConnectionActionsEnabled(bool enabled)
         {
             DashboardConnectButton.IsEnabled = enabled;
@@ -572,18 +709,66 @@ namespace QuasarLab
         {
             return (Brush)FindResource(resourceKey);
         }
-
+        private int _logTrimCounter;
         private void AddLog(string message)
         {
-            Dispatcher.Invoke(() =>
-            {
-                _logLines.Enqueue("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + message);
+            if (_shuttingDown)
+                return;
 
-                while (_logLines.Count > MaxLogLines)
-                    _logLines.Dequeue();
+            Dispatcher.BeginInvoke(
+                new Action(() =>
+                {
+                    if (_shuttingDown)
+                        return;
 
-                RefreshLogViews();
-            });
+                    string line =
+                        "[" +
+                        DateTime.Now.ToString("HH:mm:ss") +
+                        "] " +
+                        message;
+
+                    _logLines.Enqueue(line);
+
+                    bool trimmed = false;
+
+                    while (_logLines.Count > MaxLogLines)
+                    {
+                        _logLines.Dequeue();
+                        trimmed = true;
+                        _logTrimCounter++;
+                    }
+
+                    // Rebuild occasionally after trimming instead of
+                    // rebuilding both text boxes for every new line.
+                    if (trimmed &&
+                        _logTrimCounter >= 50)
+                    {
+                        _logTrimCounter = 0;
+                        RefreshLogViews();
+                        return;
+                    }
+
+                    string text =
+                        line +
+                        Environment.NewLine;
+
+                    LogTextBox.AppendText(text);
+
+                    if (MessageLogTextBox != null)
+                        MessageLogTextBox.AppendText(text);
+
+                    if (MessageLogSummaryText != null)
+                    {
+                        MessageLogSummaryText.Text =
+                            _logLines.Count +
+                            " lines";
+                    }
+
+                    LogTextBox.ScrollToEnd();
+
+                    if (MessageLogTextBox != null)
+                        MessageLogTextBox.ScrollToEnd();
+                }));
         }
 
         private void RefreshLogViews()
@@ -611,59 +796,97 @@ namespace QuasarLab
             });
         }
 
-        private void AddPacketCapture(QuasarLabService.PacketTraceEntry packet)
+        private void AddPacketCapture(
+          QuasarLabService.PacketTraceEntry packet)
         {
-            if (packet == null)
-                return;
-
-            Dispatcher.Invoke(() =>
+            if (packet == null ||
+                _shuttingDown)
             {
-                var entry = CreatePacketLogEntry(packet);
+                return;
+            }
 
-                _packetEntries.Add(entry);
-                PacketListView.Items.Add(entry);
-
-                while (_packetEntries.Count > MaxPacketEntries)
+            Dispatcher.BeginInvoke(
+                new Action(() =>
                 {
-                    _packetEntries.RemoveAt(0);
+                    if (_shuttingDown)
+                        return;
 
-                    if (PacketListView.Items.Count > 0)
-                        PacketListView.Items.RemoveAt(0);
-                }
+                    var entry =
+                        CreatePacketLogEntry(packet);
 
-                PacketCaptureSummaryText.Text = _packetEntries.Count + " packets captured";
-                PacketListView.ScrollIntoView(entry);
+                    _packetEntries.Add(entry);
+                    PacketListView.Items.Add(entry);
 
-                if (PacketListView.SelectedItem == null)
-                    PacketListView.SelectedItem = entry;
-            });
+                    while (_packetEntries.Count >
+                           MaxPacketEntries)
+                    {
+                        _packetEntries.RemoveAt(0);
+
+                        if (PacketListView.Items.Count > 0)
+                        {
+                            PacketListView.Items.RemoveAt(0);
+                        }
+                    }
+
+                    PacketCaptureSummaryText.Text =
+                        _packetEntries.Count +
+                        " packets captured";
+
+                    if (PacketListView.SelectedItem == null)
+                    {
+                        PacketListView.SelectedItem = entry;
+                    }
+
+                    // Avoid forcing scrolling for every single packet.
+                    // Only scroll when the newest packet is selected.
+                    if (ReferenceEquals(
+                            PacketListView.SelectedItem,
+                            entry))
+                    {
+                        PacketListView.ScrollIntoView(entry);
+                    }
+                }));
         }
 
-        private PacketLogEntry CreatePacketLogEntry(QuasarLabService.PacketTraceEntry packet)
+        private PacketLogEntry CreatePacketLogEntry(
+         QuasarLabService.PacketTraceEntry packet)
         {
-            int sequence = ++_packetSequence;
-            string directionText = packet.Direction == PacketDirection.Inbound ? "IN" : "OUT";
-            string clientText = "#" + packet.ConnectionIndex + " " + SafeText(packet.PcName);
-            string messageType = string.IsNullOrWhiteSpace(packet.MessageType)
-                ? "Unknown"
-                : packet.MessageType;
+            int sequence =
+                ++_packetSequence;
 
-            var entry = new PacketLogEntry
+            string directionText =
+                packet.Direction == PacketDirection.Inbound
+                    ? "IN"
+                    : "OUT";
+
+            string clientText =
+                "#" +
+                packet.ConnectionIndex +
+                " " +
+                SafeText(packet.PcName);
+
+            string messageType =
+                string.IsNullOrWhiteSpace(packet.MessageType)
+                    ? "Unknown"
+                    : packet.MessageType;
+
+            return new PacketLogEntry
             {
                 Sequence = sequence,
                 SequenceText = sequence.ToString(),
                 Timestamp = packet.Timestamp,
-                TimeText = packet.Timestamp.ToString("HH:mm:ss.fff"),
+                TimeText = packet.Timestamp.ToString(
+                    "HH:mm:ss.fff"),
                 Direction = packet.Direction,
                 DirectionText = directionText,
                 ClientText = clientText,
                 MessageType = messageType,
-                PayloadText = FormatByteCount(packet.PayloadLength),
-                FrameText = FormatByteCount(packet.FrameLength),
-                DetailsText = BuildPacketDetails(sequence, packet, clientText, messageType)
+                PayloadText = FormatByteCount(
+                    packet.PayloadLength),
+                FrameText = FormatByteCount(
+                    packet.FrameLength),
+                Packet = packet
             };
-
-            return entry;
         }
 
         private static string BuildPacketDetails(
@@ -771,22 +994,38 @@ namespace QuasarLab
         {
             return string.IsNullOrWhiteSpace(value) ? "-" : value;
         }
-        private async void CheckServerButton_Click(object sender, RoutedEventArgs e)
+        private async void CheckServerButton_Click(
+          object sender,
+          RoutedEventArgs e)
         {
             AddLog("Checking server...");
 
-            bool alive = await _service.CheckServerAsync(ServerMonitorTimeoutMs);
-            ApplyServerAvailability(alive, false);
+            bool alive =
+                await _service.CheckServerAsync(
+                    ServerMonitorTimeoutMs,
+                    true);
+
+            ApplyServerAvailability(
+                alive,
+                false);
 
             if (alive)
             {
-                AddLog("Server is listening on " +
-                       _profile.Host + ":" +
-                       _profile.Port);
+                AddLog(
+                    "TLS server is reachable at " +
+                    _profile.Host +
+                    ":" +
+                    _profile.Port +
+                    ".");
             }
             else
             {
-                AddLog("Server is offline or not accepting connections.");
+                AddLog(
+                    "TLS server check failed for " +
+                    _profile.Host +
+                    ":" +
+                    _profile.Port +
+                    ".");
             }
         }
         private static string GetComboText(ComboBox combo)
@@ -807,28 +1046,48 @@ namespace QuasarLab
             return "";
         }
 
-        private static void ParseHost(string hosts, out string host, out int port)
+        private static void ParseHost(
+       string hosts,
+       out string host,
+       out int port)
         {
-            host = "127.0.0.1";
-            port = 4782;
+            const string defaultHost = "127.0.0.1";
+            const int defaultPort = 4782;
+
+            host = defaultHost;
+            port = defaultPort;
 
             if (string.IsNullOrWhiteSpace(hosts))
                 return;
 
-            string first = hosts.Split(';')[0];
+            string first = hosts
+                .Split(';')
+                .Select(value => value.Trim())
+                .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
 
             if (string.IsNullOrWhiteSpace(first))
                 return;
 
-            string[] parts = first.Split(':');
+            Uri uri;
 
-            if (parts.Length >= 1 && !string.IsNullOrWhiteSpace(parts[0]))
-                host = parts[0];
+            if (Uri.TryCreate(
+                    "tcp://" + first,
+                    UriKind.Absolute,
+                    out uri))
+            {
+                if (!string.IsNullOrWhiteSpace(uri.Host))
+                    host = uri.Host;
 
-            if (parts.Length >= 2)
-                int.TryParse(parts[1], out port);
+                if (uri.Port > 0 && uri.Port <= 65535)
+                    port = uri.Port;
+
+                return;
+            }
+
+            // Fallback: preserve the complete value as the host
+            // and keep the default port.
+            host = first;
         }
-
         private static byte[] DecodeBase64(string value)
         {
             try
@@ -880,14 +1139,33 @@ namespace QuasarLab
                 Clipboard.SetText(PacketDetailsTextBox.Text);
         }
 
-        private void PacketListView_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        private void PacketListView_SelectionChanged(
+         object sender,
+         SelectionChangedEventArgs e)
         {
-            var entry = PacketListView.SelectedItem as PacketLogEntry;
+            var entry =
+                PacketListView.SelectedItem
+                    as PacketLogEntry;
 
-            if (entry == null)
+            if (entry == null ||
+                entry.Packet == null)
+            {
                 return;
+            }
 
-            PacketDetailsTextBox.Text = entry.DetailsText;
+            if (entry.DetailsText == null)
+            {
+                entry.DetailsText =
+                    BuildPacketDetails(
+                        entry.Sequence,
+                        entry.Packet,
+                        entry.ClientText,
+                        entry.MessageType);
+            }
+
+            PacketDetailsTextBox.Text =
+                entry.DetailsText;
+
             PacketDetailsTextBox.ScrollToHome();
         }
 
@@ -1026,6 +1304,9 @@ namespace QuasarLab
             public string MessageType { get; set; }
             public string PayloadText { get; set; }
             public string FrameText { get; set; }
+
+            public QuasarLabService.PacketTraceEntry Packet { get; set; }
+
             public string DetailsText { get; set; }
         }
 

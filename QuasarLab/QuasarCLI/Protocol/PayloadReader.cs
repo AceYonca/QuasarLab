@@ -1,6 +1,8 @@
 ﻿using ProtoBuf;
 using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace QuasarCLI.Protocol.Networking
 {
@@ -19,7 +21,60 @@ namespace QuasarCLI.Protocol.Networking
 
             _stream = stream;
         }
+        public async Task<byte[]> ReadFrameAsync(
+    CancellationToken cancellationToken)
+        {
+            byte[] header = new byte[HeaderSize];
 
+            await ReadExactIntoAsync(
+                header,
+                0,
+                HeaderSize,
+                cancellationToken).ConfigureAwait(false);
+
+            int length = BitConverter.ToInt32(header, 0);
+
+            if (length <= 0)
+                throw new InvalidDataException("Invalid payload length.");
+
+            if (length > MaxMessageSize)
+                throw new InvalidDataException("Payload too large.");
+
+            byte[] payload = new byte[length];
+
+            await ReadExactIntoAsync(
+                payload,
+                0,
+                length,
+                cancellationToken).ConfigureAwait(false);
+
+            return payload;
+        }
+
+        private async Task ReadExactIntoAsync(
+    byte[] buffer,
+    int offset,
+    int length,
+    CancellationToken cancellationToken)
+        {
+            int total = 0;
+
+            while (total < length)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                int read = await _stream.ReadAsync(
+                    buffer,
+                    offset + total,
+                    length - total,
+                    cancellationToken).ConfigureAwait(false);
+
+                if (read <= 0)
+                    throw new EndOfStreamException("Connection closed.");
+
+                total += read;
+            }
+        }
         public byte[] ReadFrame()
         {
             ReadExactInto(_headerBuffer, 0, HeaderSize);

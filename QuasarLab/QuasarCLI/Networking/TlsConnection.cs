@@ -1,13 +1,14 @@
-﻿using System;
-using System.Net.Security;
+﻿using ProtoBuf;
+using QuasarCLI.Protocol;
+using QuasarCLI.Protocol.Networking;
+using System;
 using System.IO;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading;
 using System.Threading.Tasks;
-using ProtoBuf;
-using QuasarCLI.Protocol;
-using QuasarCLI.Protocol.Networking;
 
 namespace QuasarCLI.Networking
 {
@@ -49,11 +50,26 @@ namespace QuasarCLI.Networking
 
         private static byte[] CopyBytes(byte[] value)
         {
+            const int MaxCapturedPayloadBytes = 4096;
+
             if (value == null || value.Length == 0)
                 return new byte[0];
 
-            byte[] copy = new byte[value.Length];
-            Buffer.BlockCopy(value, 0, copy, 0, value.Length);
+            int length =
+                Math.Min(
+                    value.Length,
+                    MaxCapturedPayloadBytes);
+
+            byte[] copy =
+                new byte[length];
+
+            Buffer.BlockCopy(
+                value,
+                0,
+                copy,
+                0,
+                length);
+
             return copy;
         }
     }
@@ -63,6 +79,16 @@ namespace QuasarCLI.Networking
         private TcpClient _tcpClient;
         private bool _disposed;
 
+        private readonly object _stateLock = new object();
+        private int _connectionGeneration;
+
+
+
+        private readonly object _writeLock =
+    new object();
+
+        private readonly SemaphoreSlim _readLock =
+            new SemaphoreSlim(1, 1);
         public SslStream Stream { get; private set; }
         public event EventHandler<PacketTraceEventArgs> PacketCaptured;
 
@@ -70,64 +96,180 @@ namespace QuasarCLI.Networking
         {
             get
             {
-                return !_disposed &&
-                       _tcpClient != null &&
-                       _tcpClient.Client != null &&
-                       _tcpClient.Connected &&
-                       Stream != null;
+                lock (_stateLock)
+                {
+                    return !_disposed &&
+                           _tcpClient != null &&
+                           _tcpClient.Client != null &&
+                           _tcpClient.Connected &&
+                           Stream != null &&
+                           Stream.IsAuthenticated;
+                }
             }
         }
-
-        public async Task<bool> ConnectAsync(string host, int port)
+        private static void SafeDispose(IDisposable resource)
         {
+            if (resource == null)
+                return;
+
             try
             {
-                Dispose();
-
-                _disposed = false;
-
-                _tcpClient = new TcpClient();
-                _tcpClient.NoDelay = true;
-                _tcpClient.ReceiveBufferSize = 4096;
-                _tcpClient.SendBufferSize = 4096;
-                _tcpClient.LingerState = new LingerOption(true, 0);
-
-                await _tcpClient.ConnectAsync(host, port);
-
-                Stream = new SslStream(
-                    _tcpClient.GetStream(),
-                    false,
-                    ValidateServerCertificate);
-
-                await Stream.AuthenticateAsClientAsync(
-                    host,
-                    null,
-                    SslProtocols.Tls12,
-                    false);
-
-                Stream.ReadTimeout = 1500;
-                Stream.WriteTimeout = 1500;
-
-                return true;
+                resource.Dispose();
             }
             catch
             {
-                Dispose();
+            }
+        }
+
+        private static void SafeClose(TcpClient client)
+        {
+            if (client == null)
+                return;
+
+            try
+            {
+                client.Close();
+            }
+            catch
+            {
+            }
+        }
+        public async Task<bool> ConnectAsync(string host, int port)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+                throw new ArgumentException("Host cannot be empty.", nameof(host));
+
+            if (port < 1 || port > 65535)
+                throw new ArgumentOutOfRangeException(nameof(port));
+
+            TcpClient newClient = null;
+            SslStream newStream = null;
+
+            TcpClient oldClient = null;
+            SslStream oldStream = null;
+
+            int myGeneration;
+
+            try
+            {
+                lock (_stateLock)
+                {
+                    // Invalidate any previous or concurrent connection attempt.
+                    myGeneration = ++_connectionGeneration;
+
+                    oldClient = _tcpClient;
+                    oldStream = Stream;
+
+                    _tcpClient = null;
+                    Stream = null;
+
+                    // This TlsConnection object is being reused.
+                    _disposed = false;
+                }
+
+                // Dispose old resources outside the lock.
+                SafeDispose(oldStream);
+                SafeClose(oldClient);
+
+                // IMPORTANT:
+                // Keep these as local variables until the entire connection
+                // and TLS handshake have succeeded.
+                newClient = new TcpClient
+                {
+                    NoDelay = true,
+                    ReceiveBufferSize = 4096,
+                    SendBufferSize = 4096,
+                    LingerState = new LingerOption(true, 0)
+                };
+
+                await newClient
+                    .ConnectAsync(host, port)
+                    .ConfigureAwait(false);
+
+                newStream = new SslStream(
+                    newClient.GetStream(),
+                    false,
+                    ValidateServerCertificate);
+
+                await newStream
+                    .AuthenticateAsClientAsync(
+                        host,
+                        null,
+                        SslProtocols.Tls12,
+                        false)
+                    .ConfigureAwait(false);
+
+                newStream.ReadTimeout = 1500;
+                newStream.WriteTimeout = 1500;
+
+                lock (_stateLock)
+                {
+                    // Dispose() or another ConnectAsync() may have happened
+                    // while we were awaiting TCP/TLS operations.
+                    if (_disposed ||
+                        myGeneration != _connectionGeneration)
+                    {
+                        return false;
+                    }
+
+                    // Connection succeeded. Transfer ownership to the fields.
+                    _tcpClient = newClient;
+                    Stream = newStream;
+
+                    newClient = null;
+                    newStream = null;
+
+                    return true;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
                 return false;
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+            catch (AuthenticationException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                // These are only non-null when ownership was not transferred
+                // to the TlsConnection instance.
+                SafeDispose(newStream);
+                SafeClose(newClient);
             }
         }
 
         public void SendRawPayload(byte[] payload)
         {
-            EnsureConnected();
-
             if (payload == null)
                 throw new ArgumentNullException("payload");
 
-            byte[] frame = MessageFramer.BuildFrame(payload);
+            byte[] frame =
+                MessageFramer.BuildFrame(payload);
 
-            Stream.Write(frame, 0, frame.Length);
-            Stream.Flush();
+            lock (_writeLock)
+            {
+                EnsureConnected();
+
+                Stream.Write(
+                    frame,
+                    0,
+                    frame.Length);
+
+                Stream.Flush();
+            }
 
             RaisePacketCaptured(
                 PacketDirection.Outbound,
@@ -139,10 +281,9 @@ namespace QuasarCLI.Networking
                 "Sent raw payload");
         }
 
-        public void SendMessage<T>(T message) where T : IMessage
+        public void SendMessage<T>(T message)
+         where T : IMessage
         {
-            EnsureConnected();
-
             if (message == null)
                 throw new ArgumentNullException("message");
 
@@ -154,10 +295,20 @@ namespace QuasarCLI.Networking
                 payload = ms.ToArray();
             }
 
-            byte[] frame = MessageFramer.BuildFrame(payload);
+            byte[] frame =
+                MessageFramer.BuildFrame(payload);
 
-            Stream.Write(frame, 0, frame.Length);
-            Stream.Flush();
+            lock (_writeLock)
+            {
+                EnsureConnected();
+
+                Stream.Write(
+                    frame,
+                    0,
+                    frame.Length);
+
+                Stream.Flush();
+            }
 
             RaisePacketCaptured(
                 PacketDirection.Outbound,
@@ -186,11 +337,20 @@ namespace QuasarCLI.Networking
 
         private void SendLengthOnly(int length)
         {
-            EnsureConnected();
+            byte[] header =
+                BitConverter.GetBytes(length);
 
-            byte[] header = BitConverter.GetBytes(length);
-            Stream.Write(header, 0, header.Length);
-            Stream.Flush();
+            lock (_writeLock)
+            {
+                EnsureConnected();
+
+                Stream.Write(
+                    header,
+                    0,
+                    header.Length);
+
+                Stream.Flush();
+            }
 
             RaisePacketCaptured(
                 PacketDirection.Outbound,
@@ -204,33 +364,92 @@ namespace QuasarCLI.Networking
 
         public IMessage ReadOneMessage()
         {
-            EnsureConnected();
+            _readLock.Wait();
 
             try
             {
-                var reader = new PayloadReader(Stream);
-                byte[] payload = reader.ReadFrame();
+                EnsureConnected();
+
+                var reader =
+                    new PayloadReader(Stream);
+
+                byte[] payload =
+                    reader.ReadFrame();
+
                 IMessage message;
 
-                using (var ms = new MemoryStream(payload, false))
+                using (var ms =
+                    new MemoryStream(payload, false))
                 {
-                    message = Serializer.Deserialize<IMessage>(ms);
+                    message =
+                        Serializer.Deserialize<IMessage>(ms);
                 }
 
                 RaisePacketCaptured(
                     PacketDirection.Inbound,
-                    message != null ? message.GetType().Name : "UnknownMessage",
+                    message != null
+                        ? message.GetType().Name
+                        : "UnknownMessage",
                     payload.Length,
-                    ProtocolConstants.HeaderSize + payload.Length,
+                    ProtocolConstants.HeaderSize +
+                        payload.Length,
                     payload,
                     message,
                     "Received message");
 
                 return message;
             }
-            catch
+            finally
             {
-                throw;
+                _readLock.Release();
+            }
+        }
+
+        public async Task<IMessage> ReadOneMessageAsync(
+         CancellationToken cancellationToken)
+        {
+            await _readLock
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            try
+            {
+                EnsureConnected();
+
+                var reader =
+                    new PayloadReader(Stream);
+
+                byte[] payload =
+                    await reader
+                        .ReadFrameAsync(cancellationToken)
+                        .ConfigureAwait(false);
+
+                IMessage message;
+
+                using (var ms =
+                    new MemoryStream(payload, false))
+                {
+                    message =
+                        Serializer.Deserialize<IMessage>(ms);
+                }
+
+                RaisePacketCaptured(
+                    PacketDirection.Inbound,
+                    message != null
+                        ? message.GetType().Name
+                        : "UnknownMessage",
+                    payload.Length,
+                    ProtocolConstants.HeaderSize +
+                        payload.Length,
+                    payload,
+                    message,
+                    "Received message");
+
+                return message;
+            }
+            finally
+            {
+                _readLock.Release();
             }
         }
 
@@ -330,31 +549,28 @@ namespace QuasarCLI.Networking
 
         public void Dispose()
         {
-            if (_disposed)
-                return;
+            TcpClient clientToDispose;
+            SslStream streamToDispose;
 
-            _disposed = true;
+            lock (_stateLock)
+            {
+                if (_disposed)
+                    return;
 
-            try
-            {
-                if (Stream != null)
-                    Stream.Dispose();
-            }
-            catch
-            {
-            }
+                _disposed = true;
 
-            try
-            {
-                if (_tcpClient != null)
-                    _tcpClient.Close();
-            }
-            catch
-            {
+                // Invalidate any ConnectAsync currently awaiting TCP or TLS.
+                ++_connectionGeneration;
+
+                clientToDispose = _tcpClient;
+                streamToDispose = Stream;
+
+                _tcpClient = null;
+                Stream = null;
             }
 
-            Stream = null;
-            _tcpClient = null;
+            SafeDispose(streamToDispose);
+            SafeClose(clientToDispose);
         }
     }
 }

@@ -6,12 +6,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace QuasarLab.Services
 {
     public class QuasarLabService
     {
+        public bool EnablePacketTracing { get; set; } = true;
         public class LabConnection
         {
             public int Index { get; set; }
@@ -19,9 +21,14 @@ namespace QuasarLab.Services
             public string PcName { get; set; }
             public string Username { get; set; }
             public string Status { get; set; }
+
             public TlsConnection Connection { get; set; }
-            public bool ReceiveMonitorStarted { get; set; }
+
             public bool ManualDisconnectRequested { get; set; }
+
+            public TlsConnection MonitoredConnection { get; set; }
+
+            public CancellationTokenSource MonitorCancellation { get; set; }
         }
 
         public class PacketTraceEntry
@@ -47,10 +54,32 @@ namespace QuasarLab.Services
         private bool _autoReconnect;
         private int _desiredConnections;
 
-
+        private int _nextConnectionIndex;
 
         public bool PerformanceMode { get; set; } = true;
-        public int UiUpdateEvery { get; set; } = 25;
+        public int UiUpdateEvery
+        {
+            get
+            {
+                int count;
+
+                lock (_lock)
+                {
+                    count = _connections.Count;
+                }
+
+                if (count >= 5000)
+                    return 500;
+
+                if (count >= 1000)
+                    return 250;
+
+                if (count >= 100)
+                    return 50;
+
+                return 10;
+            }
+        }
         public bool EnableReceiveMonitoring { get; set; } = false;
 
         public event Action ConnectionsChanged;
@@ -103,18 +132,52 @@ namespace QuasarLab.Services
         {
             EnableReceiveMonitoring = enabled;
 
-            if (!enabled)
-                return;
-
             List<LabConnection> snapshot;
 
             lock (_lock)
             {
-                snapshot = _connections.ToList();
+                snapshot =
+                    _connections.ToList();
+            }
+
+            if (!enabled)
+            {
+                foreach (var connection in snapshot)
+                {
+                    CancellationTokenSource cts =
+                        connection.MonitorCancellation;
+
+                    if (cts == null)
+                        continue;
+
+                    try
+                    {
+                        cts.Cancel();
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                LogMessage(
+                    "Receive monitoring disabled.");
+
+                return;
             }
 
             foreach (var connection in snapshot)
-                StartMonitor(connection);
+            {
+                if (string.Equals(
+                        connection.Status,
+                        "Connected",
+                        StringComparison.Ordinal))
+                {
+                    StartMonitor(connection);
+                }
+            }
+
+            LogMessage(
+                "Receive monitoring enabled.");
         }
 
         public int GetDesiredConnections()
@@ -145,7 +208,9 @@ namespace QuasarLab.Services
             LogMessage("Reconnect target set to: " + GetDesiredConnections());
         }
 
-        public async Task StartAutoReconnectAsync(int desiredConnections, int delayMs = 3000)
+        public async Task StartAutoReconnectAsync(
+            int desiredConnections,
+            int delayMs = 3000)
         {
             _autoReconnect = true;
             AutoReconnectEnabled = true;
@@ -154,61 +219,121 @@ namespace QuasarLab.Services
 
             if (_reconnectLoopRunning)
             {
-                LogMessage("Auto reconnect loop already running. Target: " + GetDesiredConnections());
+                LogMessage(
+                    "Auto reconnect loop already running. Target: " +
+                    GetDesiredConnections());
+
                 return;
             }
 
             _reconnectLoopRunning = true;
 
-            LogMessage("Auto reconnect loop started. Target: " + GetDesiredConnections());
+            LogMessage(
+                "Auto reconnect loop started. Target: " +
+                GetDesiredConnections());
 
             try
             {
                 while (_autoReconnect)
                 {
-                    MarkDeadConnectionsDisconnected();
+                    // Only mark connections disconnected when their
+                    // actual connection state indicates that they are dead.
+                    RefreshDeadConnections();
 
-                    LogMessage("[RECONNECT] Current: " + GetConnectionCount());
-                    LogMessage("[RECONNECT] Target: " + GetDesiredConnections());
+                    int current = GetConnectionCount();
+                    int target = GetDesiredConnections();
 
-                    if (!await CheckServerAsync(1000))
+                    LogMessage(
+                        "[RECONNECT] Current: " +
+                        current);
+
+                    LogMessage(
+                        "[RECONNECT] Target: " +
+                        target);
+
+                    // Nothing needs to be restored.
+                    if (current >= target)
                     {
-                        MarkAllConnectionsDisconnected();
-                        StatusMessage("Server offline");
+                        StatusMessage(
+                            current +
+                            " connected");
+
                         await Task.Delay(delayMs);
                         continue;
                     }
 
+                    // This health check only determines whether we should
+                    // attempt NEW connections right now.
+                    //
+                    // A failure must not destroy existing live connections.
+                    bool serverReachable =
+                        await CheckServerAsync(
+                            1000,
+                            false);
+
+                    if (!serverReachable)
+                    {
+                        StatusMessage(
+                            current > 0
+                                ? current + " connected | server check failed"
+                                : "Server unavailable");
+
+                        await Task.Delay(delayMs);
+                        continue;
+                    }
+
+                    // First restore existing disconnected slots.
                     await ReconnectDisconnectedConnectionsAsync();
 
+                    // Then create any missing connection slots.
                     while (_autoReconnect &&
                            GetConnectionCount() < GetDesiredConnections() &&
                            GetConnectionSlotCount() < GetDesiredConnections())
                     {
-                        LogMessage("[RECONNECT] Attempting reconnect...");
+                        LogMessage(
+                            "[RECONNECT] Attempting reconnect...");
 
-                        LabConnection result = await ConnectOneInternalAsync();
+                        LabConnection result =
+                            await ConnectOneInternalAsync();
 
                         if (result == null)
                         {
-                            LogMessage("[RECONNECT] Reconnect failed. Will retry next tick.");
+                            LogMessage(
+                                "[RECONNECT] Reconnect failed. " +
+                                "Will retry next tick.");
+
                             break;
                         }
 
-                        LogMessage("[RECONNECT] Reconnected.");
+                        LogMessage(
+                            "[RECONNECT] Reconnected.");
+
                         RaiseConnectionsChanged();
-                        StatusMessage(GetConnectionCount() + " connected");
+
+                        StatusMessage(
+                            GetConnectionCount() +
+                            " connected");
                     }
 
-                    StatusMessage(GetConnectionCount() + " connected");
+                    StatusMessage(
+                        GetConnectionCount() +
+                        " connected");
 
                     await Task.Delay(delayMs);
                 }
             }
+            catch (Exception ex)
+            {
+                LogMessage(
+                    "[RECONNECT] Loop error: " +
+                    ex.Message);
+            }
             finally
             {
                 _reconnectLoopRunning = false;
-                LogMessage("[RECONNECT] Loop stopped.");
+
+                LogMessage(
+                    "[RECONNECT] Loop stopped.");
             }
         }
 
@@ -222,31 +347,95 @@ namespace QuasarLab.Services
             return result;
         }
 
-        public async Task<bool> CheckServerAsync(int timeoutMs = 1500)
+        public async Task<bool> CheckServerAsync(
+         int timeoutMs = 1500,
+         bool logResult = true)
         {
             if (Profile == null)
                 return false;
 
+            TlsConnection connection = null;
+
             try
             {
-                using (var client = new TcpClient())
+                connection = new TlsConnection();
+
+                Task<bool> connectTask =
+                    connection.ConnectAsync(
+                        Profile.Host,
+                        Profile.Port);
+
+                Task timeoutTask =
+                    Task.Delay(timeoutMs);
+
+                Task completed =
+                    await Task.WhenAny(
+                        connectTask,
+                        timeoutTask);
+
+                if (completed != connectTask)
                 {
-                    var connectTask =
-                        client.ConnectAsync(Profile.Host, Profile.Port);
+                    if (logResult)
+                    {
+                        LogMessage(
+                            "[SERVER CHECK] TLS connection timed out after " +
+                            timeoutMs +
+                            " ms.");
+                    }
 
-                    var timeoutTask =
-                        Task.Delay(timeoutMs);
-
-                    var finished =
-                        await Task.WhenAny(connectTask, timeoutTask);
-
-                    return finished == connectTask &&
-                           client.Connected;
+                    return false;
                 }
+
+                bool connected =
+                    await connectTask;
+
+                if (!connected ||
+                    !connection.IsConnected)
+                {
+                    if (logResult)
+                    {
+                        LogMessage(
+                            "[SERVER CHECK] TLS connection failed.");
+                    }
+
+                    return false;
+                }
+
+                if (logResult)
+                {
+                    LogMessage(
+                        "[SERVER CHECK] TLS server reachable at " +
+                        Profile.Host +
+                        ":" +
+                        Profile.Port +
+                        ".");
+                }
+
+                return true;
             }
-            catch
+            catch (Exception ex)
             {
+                if (logResult)
+                {
+                    LogMessage(
+                        "[SERVER CHECK] Failed: " +
+                        ex.Message);
+                }
+
                 return false;
+            }
+            finally
+            {
+                if (connection != null)
+                {
+                    try
+                    {
+                        connection.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                }
             }
         }
 
@@ -307,7 +496,37 @@ namespace QuasarLab.Services
             };
 
             AttachPacketTrace(labConnection);
+
+            labConnection.Status = "Authenticating";
+
             conn.SendMessage(BuildIdentification(labConnection));
+
+            bool accepted = await WaitForIdentificationAcceptedAsync(conn);
+
+            if (!accepted)
+            {
+                labConnection.Status = "Rejected";
+
+                try
+                {
+                    conn.Dispose();
+                }
+                catch
+                {
+                }
+
+                LogMessage(
+                    "[" + index + "] Server did not accept client identification.");
+
+                if (!PerformanceMode || index % UiUpdateEvery == 0)
+                {
+                    RaiseConnectionsChanged();
+                    StatusMessage("Authentication failed");
+                }
+
+                return null;
+            }
+
             labConnection.Status = "Connected";
 
             lock (_lock)
@@ -322,14 +541,102 @@ namespace QuasarLab.Services
 
             if (!PerformanceMode || index % UiUpdateEvery == 0)
             {
-                LogMessage(count + " clients connected...");
+                LogMessage(
+                    "[" + index + "] Authenticated successfully. " +
+                    count + " clients connected.");
+
                 RaiseConnectionsChanged();
                 StatusMessage(count + " connected");
             }
 
             return labConnection;
         }
+        private async Task<bool> WaitForIdentificationAcceptedAsync(
+       TlsConnection conn,
+       int timeoutMs = 2500)
+        {
+            if (conn == null || !conn.IsConnected)
+                return false;
 
+            using (var cts =
+                new CancellationTokenSource(timeoutMs))
+            {
+                try
+                {
+                    IMessage message =
+                        await conn
+                            .ReadOneMessageAsync(cts.Token)
+                            .ConfigureAwait(false);
+
+                    var result =
+                        message as ClientIdentificationResult;
+
+                    if (result == null)
+                    {
+                        LogMessage(
+                            "[HANDSHAKE] Expected " +
+                            "ClientIdentificationResult but received: " +
+                            (message != null
+                                ? message.GetType().Name
+                                : "null"));
+
+                        return false;
+                    }
+
+                    if (!result.Result)
+                    {
+                        LogMessage(
+                            "[HANDSHAKE] Server rejected " +
+                            "client identification.");
+
+                        return false;
+                    }
+
+                    // Don't generate thousands of success-log entries
+                    // during high-volume performance tests.
+                    if (!PerformanceMode)
+                    {
+                        LogMessage(
+                            "[HANDSHAKE] Client identification accepted.");
+                    }
+
+                    return true;
+                }
+                catch (OperationCanceledException)
+                {
+                    LogMessage(
+                        "[HANDSHAKE] Timed out after " +
+                        timeoutMs +
+                        " ms waiting for identification result.");
+
+                    return false;
+                }
+                catch (IOException ex)
+                {
+                    LogMessage(
+                        "[HANDSHAKE] Connection error: " +
+                        ex.Message);
+
+                    return false;
+                }
+                catch (ObjectDisposedException)
+                {
+                    LogMessage(
+                        "[HANDSHAKE] Connection was closed " +
+                        "during authentication.");
+
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    LogMessage(
+                        "[HANDSHAKE] Authentication failed: " +
+                        ex.Message);
+
+                    return false;
+                }
+            }
+        }
         private ClientIdentification BuildIdentification(LabConnection labConnection)
         {
             var identification = new ClientIdentification
@@ -361,32 +668,73 @@ namespace QuasarLab.Services
         {
             List<LabConnection> disconnected;
 
+            int missing;
+
             lock (_lock)
             {
-                disconnected = _connections
-                    .Where(c => c.Status == "Disconnected")
-                    .Take(Math.Max(GetDesiredConnections() - GetConnectionCount(), 0))
-                    .ToList();
+                int connected =
+                    _connections.Count(c =>
+                        string.Equals(
+                            c.Status,
+                            "Connected",
+                            StringComparison.Ordinal));
+
+                missing =
+                    Math.Max(
+                        _desiredConnections - connected,
+                        0);
+
+                disconnected =
+                    _connections
+                        .Where(c =>
+                            string.Equals(
+                                c.Status,
+                                "Disconnected",
+                                StringComparison.Ordinal))
+                        .Take(missing)
+                        .ToList();
             }
 
             foreach (var labConnection in disconnected)
             {
-                if (!_autoReconnect || GetConnectionCount() >= GetDesiredConnections())
-                    return;
-
-                LogMessage("[RECONNECT] Reconnecting #" + labConnection.Index + ": " + labConnection.PcName);
-
-                bool reconnected = await ReconnectExistingConnectionAsync(labConnection);
-
-                if (!reconnected)
+                if (!_autoReconnect ||
+                    GetConnectionCount() >= GetDesiredConnections())
                 {
-                    LogMessage("[RECONNECT] Reconnect failed for #" + labConnection.Index + ".");
                     return;
                 }
 
-                LogMessage("[RECONNECT] Reconnected #" + labConnection.Index + ".");
+                LogMessage(
+                    "[RECONNECT] Reconnecting #" +
+                    labConnection.Index +
+                    ": " +
+                    labConnection.PcName);
+
+                bool reconnected =
+                    await ReconnectExistingConnectionAsync(
+                        labConnection);
+
+                if (!reconnected)
+                {
+                    LogMessage(
+                        "[RECONNECT] Reconnect failed for #" +
+                        labConnection.Index +
+                        ".");
+
+                    // Try the remaining disconnected entries
+                    // instead of aborting the complete cycle.
+                    continue;
+                }
+
+                LogMessage(
+                    "[RECONNECT] Reconnected #" +
+                    labConnection.Index +
+                    ".");
+
                 RaiseConnectionsChanged();
-                StatusMessage(GetConnectionCount() + " connected");
+
+                StatusMessage(
+                    GetConnectionCount() +
+                    " connected");
             }
         }
 
@@ -407,10 +755,33 @@ namespace QuasarLab.Services
             {
                 labConnection.Connection = conn;
                 labConnection.ManualDisconnectRequested = false;
-                labConnection.Status = "Connecting";
+                labConnection.Status = "Authenticating";
 
                 AttachPacketTrace(labConnection);
+
                 conn.SendMessage(BuildIdentification(labConnection));
+
+                bool accepted = await WaitForIdentificationAcceptedAsync(conn);
+
+                if (!accepted)
+                {
+                    try
+                    {
+                        conn.Dispose();
+                    }
+                    catch
+                    {
+                    }
+
+                    labConnection.Connection = null;
+                    labConnection.Status = "Disconnected";
+
+                    LogMessage(
+                        "[RECONNECT] Server rejected #" +
+                        labConnection.Index + ".");
+
+                    return false;
+                }
 
                 labConnection.Status = "Connected";
 
@@ -435,34 +806,90 @@ namespace QuasarLab.Services
                 return false;
             }
         }
-
-        private void StartMonitor(LabConnection labConnection)
+        private void StartMonitor(
+          LabConnection labConnection)
         {
             if (labConnection == null ||
                 labConnection.Connection == null ||
-                labConnection.ReceiveMonitorStarted)
+                !EnableReceiveMonitoring)
+            {
                 return;
+            }
 
-            labConnection.ReceiveMonitorStarted = true;
+            TlsConnection monitoredConnection =
+                labConnection.Connection;
 
-            Task.Run(() =>
+            // If this exact connection already has a live monitor,
+            // do not create another reader.
+            if (ReferenceEquals(
+                    labConnection.MonitoredConnection,
+                    monitoredConnection) &&
+                labConnection.MonitorCancellation != null &&
+                !labConnection.MonitorCancellation
+                    .IsCancellationRequested)
+            {
+                return;
+            }
+
+            // Stop any previous monitor associated with this slot.
+            CancellationTokenSource previousCts =
+                labConnection.MonitorCancellation;
+
+            if (previousCts != null)
+            {
+                try
+                {
+                    previousCts.Cancel();
+                }
+                catch
+                {
+                }
+            }
+
+            var monitorCts =
+                new CancellationTokenSource();
+
+            CancellationToken token =
+                monitorCts.Token;
+
+            labConnection.MonitoredConnection =
+                monitoredConnection;
+
+            labConnection.MonitorCancellation =
+                monitorCts;
+
+            Task.Run(async () =>
             {
                 bool disconnected = false;
 
                 try
                 {
                     while (EnableReceiveMonitoring &&
-                           labConnection.Connection != null &&
-                           labConnection.Connection.IsConnected)
+                           !token.IsCancellationRequested &&
+                           monitoredConnection.IsConnected)
                     {
+                        // This connection slot may have been reconnected
+                        // and assigned a completely new TlsConnection.
+                        if (!ReferenceEquals(
+                                labConnection.Connection,
+                                monitoredConnection))
+                        {
+                            return;
+                        }
+
                         try
                         {
-                            labConnection.Connection.ReadOneMessage();
+                            await monitoredConnection
+                                .ReadOneMessageAsync(token)
+                                .ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            return;
                         }
                         catch (IOException)
                         {
-                            if (labConnection.Connection != null &&
-                                labConnection.Connection.IsAlive())
+                            if (monitoredConnection.IsAlive())
                                 continue;
 
                             disconnected = true;
@@ -481,33 +908,86 @@ namespace QuasarLab.Services
                 }
                 finally
                 {
-                    labConnection.ReceiveMonitorStarted = false;
+                    // Only clear monitor state if this is still the
+                    // monitor associated with this exact connection
+                    // and this exact CancellationTokenSource.
+                    if (ReferenceEquals(
+                            labConnection.MonitoredConnection,
+                            monitoredConnection) &&
+                        ReferenceEquals(
+                            labConnection.MonitorCancellation,
+                            monitorCts))
+                    {
+                        labConnection.MonitoredConnection =
+                            null;
+
+                        labConnection.MonitorCancellation =
+                            null;
+                    }
+
+                    try
+                    {
+                        monitorCts.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (token.IsCancellationRequested)
+                    return;
+
+                if (!ReferenceEquals(
+                        labConnection.Connection,
+                        monitoredConnection))
+                {
+                    return;
                 }
 
                 if (!disconnected &&
-                    labConnection.Connection != null &&
-                    labConnection.Connection.IsAlive())
+                    monitoredConnection.IsAlive())
+                {
                     return;
+                }
 
                 if (labConnection.ManualDisconnectRequested)
                     return;
 
-                labConnection.Status = "Disconnected";
+                labConnection.Status =
+                    "Disconnected";
 
-                LogMessage("[" + labConnection.Index + "] Connection lost: " + labConnection.PcName);
+                LogMessage(
+                    "[" +
+                    labConnection.Index +
+                    "] Connection lost: " +
+                    labConnection.PcName);
+
                 RaiseConnectionsChanged();
             });
         }
 
-        private void AttachPacketTrace(LabConnection labConnection)
+        private void AttachPacketTrace(
+         LabConnection labConnection)
         {
-            if (labConnection == null || labConnection.Connection == null)
+            if (!EnablePacketTracing)
                 return;
 
-            labConnection.Connection.PacketCaptured += (sender, e) =>
+            if (labConnection == null ||
+                labConnection.Connection == null)
             {
-                RaisePacketCaptured(labConnection, e);
-            };
+                return;
+            }
+
+            labConnection.Connection.PacketCaptured +=
+                (sender, e) =>
+                {
+                    if (!EnablePacketTracing)
+                        return;
+
+                    RaisePacketCaptured(
+                        labConnection,
+                        e);
+                };
         }
 
         private void RaisePacketCaptured(LabConnection labConnection, PacketTraceEventArgs e)
@@ -534,41 +1014,100 @@ namespace QuasarLab.Services
             });
         }
 
-        private void MarkDeadConnectionsDisconnected()
+        public int RefreshDeadConnections()
         {
-            List<LabConnection> deadConnections;
+            var deadConnections =
+                new List<Tuple<
+                    LabConnection,
+                    TlsConnection,
+                    CancellationTokenSource>>();
 
             lock (_lock)
             {
-                deadConnections = _connections
-                    .Where(c =>
-                        c.Status == "Connected" &&
-                        (c.Connection == null || !c.Connection.IsAlive()))
-                    .ToList();
-
-                foreach (var dead in deadConnections)
+                foreach (var connection in _connections)
                 {
-                    dead.Status = "Disconnected";
+                    if (!string.Equals(
+                            connection.Status,
+                            "Connected",
+                            StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    TlsConnection transport =
+                        connection.Connection;
+
+                    bool isDead =
+                        transport == null ||
+                        !transport.IsAlive();
+
+                    if (!isDead)
+                        continue;
+
+                    CancellationTokenSource monitorCts =
+                        connection.MonitorCancellation;
+
+                    connection.Status = "Disconnected";
+                    connection.Connection = null;
+                    connection.MonitoredConnection = null;
+                    connection.MonitorCancellation = null;
+
+                    deadConnections.Add(
+                        Tuple.Create(
+                            connection,
+                            transport,
+                            monitorCts));
                 }
             }
 
-            foreach (var dead in deadConnections)
+            foreach (var item in deadConnections)
             {
+                LabConnection labConnection =
+                    item.Item1;
+
+                TlsConnection transport =
+                    item.Item2;
+
+                CancellationTokenSource monitorCts =
+                    item.Item3;
+
+                if (monitorCts != null)
+                {
+                    try
+                    {
+                        monitorCts.Cancel();
+                    }
+                    catch
+                    {
+                    }
+                }
+
                 try
                 {
-                    if (dead.Connection != null)
-                        dead.Connection.Dispose();
+                    if (transport != null)
+                        transport.Dispose();
                 }
                 catch
                 {
                 }
 
-                dead.Connection = null;
-                LogMessage("Marked disconnected: " + dead.PcName);
+                LogMessage(
+                    "[" +
+                    labConnection.Index +
+                    "] Marked disconnected: " +
+                    labConnection.PcName);
             }
 
             if (deadConnections.Count > 0)
+            {
                 RaiseConnectionsChanged();
+
+                StatusMessage(
+                    GetConnectionCount() +
+                    " connected");
+            }
+
+            return deadConnections.Count;
         }
 
         public void MarkAllConnectionsDisconnected()
@@ -693,13 +1232,7 @@ namespace QuasarLab.Services
 
         private int GetNextIndex()
         {
-            lock (_lock)
-            {
-                if (_connections.Count == 0)
-                    return 1;
-
-                return _connections.Max(c => c.Index) + 1;
-            }
+            return Interlocked.Increment(ref _nextConnectionIndex);
         }
 
         private void RaiseConnectionsChanged()
