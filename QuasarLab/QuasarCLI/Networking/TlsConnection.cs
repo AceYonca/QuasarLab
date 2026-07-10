@@ -281,18 +281,21 @@ namespace QuasarCLI.Networking
                 "Sent raw payload");
         }
 
-        public void SendMessage<T>(T message)
-         where T : IMessage
+        public void SendMessage(IMessage message)
         {
             if (message == null)
-                throw new ArgumentNullException("message");
+                throw new ArgumentNullException(nameof(message));
 
             byte[] payload;
 
             using (var ms = new MemoryStream(256))
             {
-                Serializer.Serialize(ms, message);
-                payload = ms.ToArray();
+                Serializer.Serialize<IMessage>(
+                    ms,
+                    message);
+
+                payload =
+                    ms.ToArray();
             }
 
             byte[] frame =

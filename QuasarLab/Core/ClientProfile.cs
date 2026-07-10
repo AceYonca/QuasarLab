@@ -1,3 +1,5 @@
+using QuasarCLI.Common.Cryptography;
+
 namespace QuasarLab.Services
 {
     public enum ProfileMode
@@ -25,13 +27,18 @@ namespace QuasarLab.Services
 
         public string Tag { get; set; }
 
-
         public string PcNameTemplate { get; set; }
         public string UsernameTemplate { get; set; }
 
-
         public string EncryptionKey { get; set; }
         public byte[] Signature { get; set; }
+
+        /// <summary>
+        /// Optional crypto parameters recovered from QuasarRecover JSON.
+        /// Null means stock Quasar defaults are used when local decryption
+        /// of legacy raw settings is necessary.
+        /// </summary>
+        public QuasarCryptoProfile CryptoProfile { get; set; }
 
         public static ClientProfile Debug()
         {
@@ -51,12 +58,15 @@ namespace QuasarLab.Services
                 Country = "Local Lab",
                 CountryCode = "XX",
                 ImageIndex = 0,
+
                 PcNameTemplate = "DESKTOP-{INDEX}",
                 UsernameTemplate = "User-{INDEX}",
+
                 Tag = "DEBUG",
 
                 EncryptionKey = null,
-                Signature = null
+                Signature = null,
+                CryptoProfile = null
             };
         }
 
@@ -66,7 +76,8 @@ namespace QuasarLab.Services
             string version,
             string tag,
             string encryptionKey,
-            byte[] signature)
+            byte[] signature,
+            QuasarCryptoProfile cryptoProfile = null)
         {
             return new ClientProfile
             {
@@ -82,17 +93,18 @@ namespace QuasarLab.Services
                 OperatingSystem = "Windows 11 Pro x64",
                 AccountType = "Administrator",
                 Country = "United States",
+                CountryCode = "US",
+                ImageIndex = 0,
 
                 PcNameTemplate = "DESKTOP-{INDEX}",
                 UsernameTemplate = "User-{INDEX}",
 
-                CountryCode = "US",
-                ImageIndex = 0,
-
                 Tag = tag,
 
                 EncryptionKey = encryptionKey,
-                Signature = signature
+                Signature = signature,
+
+                CryptoProfile = cryptoProfile
             };
         }
     }

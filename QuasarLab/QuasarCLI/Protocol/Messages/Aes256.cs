@@ -1,142 +1,608 @@
-﻿using System;
+using System;
 using System.IO;
-using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 
 namespace QuasarCLI.Common.Cryptography
 {
-    public class Aes256
+    /// <summary>
+    /// Quasar-compatible authenticated AES decryptor/encryptor.
+    ///
+    /// new Aes256(masterKey) keeps stock Quasar behavior.
+    /// new Aes256(masterKey, cryptoProfile) uses parameters recovered
+    /// from QuasarRecover JSON and falls back only for missing values.
+    /// </summary>
+    public sealed class Aes256
     {
-        private const int KeyLength = 32;
-        private const int AuthKeyLength = 64;
-        private const int IvLength = 16;
-        private const int HmacSha256Length = 32;
+        private const int DefaultKeyLength = 32;
+        private const int DefaultAuthKeyLength = 64;
+        private const int DefaultIvLength = 16;
+        private const int DefaultHmacLength = 32;
+        private const int DefaultIterations = 50000;
+        private const int DefaultAesKeySizeBits = 256;
+        private const int DefaultAesBlockSizeBits = 128;
+
+        private static readonly byte[] DefaultSalt =
+        {
+            0xBF, 0xEB, 0x1E, 0x56, 0xFB, 0xCD, 0x97, 0x3B,
+            0xB2, 0x19, 0x02, 0x24, 0x30, 0xA5, 0x78, 0x43,
+            0x00, 0x3D, 0x56, 0x44, 0xD2, 0x1E, 0x62, 0xB9,
+            0xD4, 0xF1, 0x80, 0xE7, 0xE6, 0xC3, 0x39, 0x41
+        };
+
         private readonly byte[] _key;
         private readonly byte[] _authKey;
 
-        private static readonly byte[] Salt =
-        {
-            0xBF, 0xEB, 0x1E, 0x56, 0xFB, 0xCD, 0x97, 0x3B, 0xB2, 0x19, 0x2, 0x24, 0x30, 0xA5, 0x78, 0x43, 0x0, 0x3D, 0x56,
-            0x44, 0xD2, 0x1E, 0x62, 0xB9, 0xD4, 0xF1, 0x80, 0xE7, 0xE6, 0xC3, 0x39, 0x41
-        };
+        private readonly int _ivLength;
+        private readonly int _hmacLength;
+        private readonly int _aesKeySizeBits;
+        private readonly int _aesBlockSizeBits;
+
+        private readonly CipherMode _cipherMode;
+        private readonly PaddingMode _paddingMode;
+
+        private readonly string _hmacAlgorithm;
+        private readonly string _kdfHashAlgorithm;
 
         public Aes256(string masterKey)
+            : this(masterKey, null)
+        {
+        }
+
+        public Aes256(
+            string masterKey,
+            QuasarCryptoProfile profile)
         {
             if (string.IsNullOrEmpty(masterKey))
-                throw new ArgumentException($"{nameof(masterKey)} can not be null or empty.");
-
-            using (Rfc2898DeriveBytes derive = new Rfc2898DeriveBytes(masterKey, Salt, 50000))
             {
-                _key = derive.GetBytes(KeyLength);
-                _authKey = derive.GetBytes(AuthKeyLength);
+                throw new ArgumentException(
+                    "Master key cannot be null or empty.",
+                    nameof(masterKey));
+            }
+
+            byte[] salt =
+                profile != null &&
+                profile.Salt != null &&
+                profile.Salt.Length > 0
+                    ? CloneBytes(profile.Salt)
+                    : CloneBytes(DefaultSalt);
+
+            int iterations =
+                PositiveOrDefault(
+                    profile != null
+                        ? profile.KdfIterations
+                        : null,
+                    DefaultIterations);
+
+            int keyLength =
+                PositiveOrDefault(
+                    profile != null
+                        ? profile.EncryptionKeyLength
+                        : null,
+                    DefaultKeyLength);
+
+            int authKeyLength =
+                PositiveOrDefault(
+                    profile != null
+                        ? profile.AuthenticationKeyLength
+                        : null,
+                    DefaultAuthKeyLength);
+
+            _ivLength =
+                PositiveOrDefault(
+                    profile != null
+                        ? profile.IvLength
+                        : null,
+                    DefaultIvLength);
+
+            _hmacAlgorithm =
+                ValueOrDefault(
+                    profile != null
+                        ? profile.HmacAlgorithm
+                        : null,
+                    "HMACSHA256");
+
+            _hmacLength =
+                PositiveOrDefault(
+                    profile != null
+                        ? profile.HmacLength
+                        : null,
+                    GetDefaultHmacLength(
+                        _hmacAlgorithm));
+
+            _aesKeySizeBits =
+                PositiveOrDefault(
+                    profile != null
+                        ? profile.AesKeySizeBits
+                        : null,
+                    keyLength * 8);
+
+            _aesBlockSizeBits =
+                PositiveOrDefault(
+                    profile != null
+                        ? profile.AesBlockSizeBits
+                        : null,
+                    _ivLength * 8);
+
+            if (_aesKeySizeBits <= 0)
+                _aesKeySizeBits = DefaultAesKeySizeBits;
+
+            if (_aesBlockSizeBits <= 0)
+                _aesBlockSizeBits = DefaultAesBlockSizeBits;
+
+            _cipherMode =
+                ParseCipherMode(
+                    profile != null
+                        ? profile.CipherMode
+                        : null);
+
+            _paddingMode =
+                ParsePaddingMode(
+                    profile != null
+                        ? profile.PaddingMode
+                        : null);
+
+            _kdfHashAlgorithm =
+                ValueOrDefault(
+                    profile != null
+                        ? profile.KdfHashAlgorithm
+                        : null,
+                    "SHA1");
+
+            using (Rfc2898DeriveBytes derive =
+                CreateDeriver(
+                    masterKey,
+                    salt,
+                    iterations,
+                    _kdfHashAlgorithm))
+            {
+                _key =
+                    derive.GetBytes(
+                        keyLength);
+
+                _authKey =
+                    derive.GetBytes(
+                        authKeyLength);
             }
         }
 
         public string Encrypt(string input)
         {
-            return Convert.ToBase64String(Encrypt(Encoding.UTF8.GetBytes(input)));
+            if (input == null)
+                throw new ArgumentNullException(nameof(input));
+
+            return Convert.ToBase64String(
+                Encrypt(
+                    Encoding.UTF8.GetBytes(input)));
         }
 
-        /* FORMAT
-         * ----------------------------------------
-         * |     HMAC     |   IV   |  CIPHERTEXT  |
-         * ----------------------------------------
-         *     32 bytes    16 bytes
-         */
         public byte[] Encrypt(byte[] input)
         {
             if (input == null)
-                throw new ArgumentNullException($"{nameof(input)} can not be null.");
+                throw new ArgumentNullException(nameof(input));
 
-            using (var ms = new MemoryStream())
+            using (var output = new MemoryStream())
             {
-                ms.Position = HmacSha256Length; // reserve first 32 bytes for HMAC
-                using (var aesProvider = new AesCryptoServiceProvider())
+                output.Position = _hmacLength;
+
+                using (SymmetricAlgorithm aes =
+                    CreateAes())
                 {
-                    aesProvider.KeySize = 256;
-                    aesProvider.BlockSize = 128;
-                    aesProvider.Mode = CipherMode.CBC;
-                    aesProvider.Padding = PaddingMode.PKCS7;
-                    aesProvider.Key = _key;
-                    aesProvider.GenerateIV();
+                    aes.GenerateIV();
 
-                    using (var cs = new CryptoStream(ms, aesProvider.CreateEncryptor(), CryptoStreamMode.Write))
+                    using (var cryptoStream =
+                        new CryptoStream(
+                            output,
+                            aes.CreateEncryptor(),
+                            CryptoStreamMode.Write,
+                            true))
                     {
-                        ms.Write(aesProvider.IV, 0, aesProvider.IV.Length); // write next 16 bytes the IV, followed by ciphertext
-                        cs.Write(input, 0, input.Length);
-                        cs.FlushFinalBlock();
+                        output.Write(
+                            aes.IV,
+                            0,
+                            aes.IV.Length);
 
-                        using (var hmac = new HMACSHA256(_authKey))
-                        {
-                            byte[] hash = hmac.ComputeHash(ms.ToArray(), HmacSha256Length, ms.ToArray().Length - HmacSha256Length); // compute the HMAC of IV and ciphertext
-                            ms.Position = 0; // write hash at beginning
-                            ms.Write(hash, 0, hash.Length);
-                        }
+                        cryptoStream.Write(
+                            input,
+                            0,
+                            input.Length);
+
+                        cryptoStream.FlushFinalBlock();
                     }
+
+                    byte[] data =
+                        output.ToArray();
+
+                    byte[] hash;
+
+                    using (HMAC hmac =
+                        CreateHmac(
+                            _hmacAlgorithm,
+                            _authKey))
+                    {
+                        hash =
+                            hmac.ComputeHash(
+                                data,
+                                _hmacLength,
+                                data.Length - _hmacLength);
+                    }
+
+                    if (_hmacLength > hash.Length)
+                    {
+                        throw new CryptographicException(
+                            "Configured HMAC length exceeds the selected HMAC output size.");
+                    }
+
+                    output.Position = 0;
+
+                    output.Write(
+                        hash,
+                        0,
+                        _hmacLength);
                 }
 
-                return ms.ToArray();
+                return output.ToArray();
             }
         }
-        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
-        public static bool AreEqual(byte[] a1, byte[] a2)
-        {
-            bool result = true;
-            for (int i = 0; i < a1.Length; ++i)
-            {
-                if (a1[i] != a2[i])
-                    result = false;
-            }
-            return result;
-        }
-
-
 
         public string Decrypt(string input)
         {
-            return Encoding.UTF8.GetString(Decrypt(Convert.FromBase64String(input)));
+            if (input == null)
+                throw new ArgumentNullException(nameof(input));
+
+            return Encoding.UTF8.GetString(
+                Decrypt(
+                    Convert.FromBase64String(input)));
         }
 
         public byte[] Decrypt(byte[] input)
         {
             if (input == null)
-                throw new ArgumentNullException($"{nameof(input)} can not be null.");
+                throw new ArgumentNullException(nameof(input));
 
-            using (var ms = new MemoryStream(input))
+            int minimumLength =
+                checked(
+                    _hmacLength +
+                    _ivLength +
+                    1);
+
+            if (input.Length < minimumLength)
             {
-                using (var aesProvider = new AesCryptoServiceProvider())
+                throw new CryptographicException(
+                    "Encrypted payload is too short for the recovered crypto profile.");
+            }
+
+            int authenticatedLength =
+                input.Length -
+                _hmacLength;
+
+            byte[] computedHash;
+
+            using (HMAC hmac =
+                CreateHmac(
+                    _hmacAlgorithm,
+                    _authKey))
+            {
+                computedHash =
+                    hmac.ComputeHash(
+                        input,
+                        _hmacLength,
+                        authenticatedLength);
+            }
+
+            if (_hmacLength > computedHash.Length)
+            {
+                throw new CryptographicException(
+                    "Configured HMAC length exceeds the selected HMAC output size.");
+            }
+
+            byte[] receivedHash =
+                new byte[_hmacLength];
+
+            Buffer.BlockCopy(
+                input,
+                0,
+                receivedHash,
+                0,
+                _hmacLength);
+
+            if (!FixedTimeEqualsPrefix(
+                    computedHash,
+                    receivedHash,
+                    _hmacLength))
+            {
+                throw new CryptographicException(
+                    "Invalid message authentication code (MAC).");
+            }
+
+            byte[] iv =
+                new byte[_ivLength];
+
+            Buffer.BlockCopy(
+                input,
+                _hmacLength,
+                iv,
+                0,
+                _ivLength);
+
+            int ciphertextOffset =
+                _hmacLength +
+                _ivLength;
+
+            int ciphertextLength =
+                input.Length -
+                ciphertextOffset;
+
+            if (ciphertextLength <= 0)
+            {
+                throw new CryptographicException(
+                    "Encrypted payload contains no ciphertext.");
+            }
+
+            using (SymmetricAlgorithm aes =
+                CreateAes())
+            {
+                if (iv.Length != aes.BlockSize / 8)
                 {
-                    aesProvider.KeySize = 256;
-                    aesProvider.BlockSize = 128;
-                    aesProvider.Mode = CipherMode.CBC;
-                    aesProvider.Padding = PaddingMode.PKCS7;
-                    aesProvider.Key = _key;
+                    throw new CryptographicException(
+                        "Recovered IV length does not match the recovered AES block size.");
+                }
 
-                    // read first 32 bytes for HMAC
-                    using (var hmac = new HMACSHA256(_authKey))
-                    {
-                        var hash = hmac.ComputeHash(ms.ToArray(), HmacSha256Length, ms.ToArray().Length - HmacSha256Length);
-                        byte[] receivedHash = new byte[HmacSha256Length];
-                        ms.Read(receivedHash, 0, receivedHash.Length);
+                aes.IV =
+                    iv;
 
-                        if (!AreEqual(hash, receivedHash))
-                            throw new CryptographicException("Invalid message authentication code (MAC).");
-                    }
+                using (var cipherStream =
+                    new MemoryStream(
+                        input,
+                        ciphertextOffset,
+                        ciphertextLength,
+                        false))
+                using (var cryptoStream =
+                    new CryptoStream(
+                        cipherStream,
+                        aes.CreateDecryptor(),
+                        CryptoStreamMode.Read))
+                using (var plaintext =
+                    new MemoryStream())
+                {
+                    cryptoStream.CopyTo(
+                        plaintext);
 
-                    byte[] iv = new byte[IvLength];
-                    ms.Read(iv, 0, IvLength); // read next 16 bytes for IV, followed by ciphertext
-                    aesProvider.IV = iv;
-
-                    using (var cs = new CryptoStream(ms, aesProvider.CreateDecryptor(), CryptoStreamMode.Read))
-                    {
-                        byte[] temp = new byte[ms.Length - IvLength + 1];
-                        byte[] data = new byte[cs.Read(temp, 0, temp.Length)];
-                        Buffer.BlockCopy(temp, 0, data, 0, data.Length);
-                        return data;
-                    }
+                    return plaintext.ToArray();
                 }
             }
+        }
+
+        private SymmetricAlgorithm CreateAes()
+        {
+            Aes aes =
+                Aes.Create();
+
+            aes.KeySize =
+                _aesKeySizeBits;
+
+            aes.BlockSize =
+                _aesBlockSizeBits;
+
+            aes.Mode =
+                _cipherMode;
+
+            aes.Padding =
+                _paddingMode;
+
+            aes.Key =
+                CloneBytes(_key);
+
+            return aes;
+        }
+
+        private static Rfc2898DeriveBytes CreateDeriver(
+            string masterKey,
+            byte[] salt,
+            int iterations,
+            string hashAlgorithm)
+        {
+            string normalized =
+                NormalizeAlgorithmName(
+                    hashAlgorithm);
+
+            switch (normalized)
+            {
+                case "SHA256":
+                    return new Rfc2898DeriveBytes(
+                        masterKey,
+                        salt,
+                        iterations,
+                        HashAlgorithmName.SHA256);
+
+                case "SHA384":
+                    return new Rfc2898DeriveBytes(
+                        masterKey,
+                        salt,
+                        iterations,
+                        HashAlgorithmName.SHA384);
+
+                case "SHA512":
+                    return new Rfc2898DeriveBytes(
+                        masterKey,
+                        salt,
+                        iterations,
+                        HashAlgorithmName.SHA512);
+
+                case "SHA1":
+                default:
+                    // Matches stock Quasar's legacy constructor behavior.
+                    return new Rfc2898DeriveBytes(
+                        masterKey,
+                        salt,
+                        iterations);
+            }
+        }
+
+        private static HMAC CreateHmac(
+            string algorithm,
+            byte[] key)
+        {
+            string normalized =
+                NormalizeAlgorithmName(
+                    algorithm);
+
+            switch (normalized)
+            {
+                case "HMACMD5":
+                    return new HMACMD5(
+                        CloneBytes(key));
+
+                case "HMACSHA1":
+                    return new HMACSHA1(
+                        CloneBytes(key));
+
+                case "HMACSHA384":
+                    return new HMACSHA384(
+                        CloneBytes(key));
+
+                case "HMACSHA512":
+                    return new HMACSHA512(
+                        CloneBytes(key));
+
+                case "HMACSHA256":
+                default:
+                    return new HMACSHA256(
+                        CloneBytes(key));
+            }
+        }
+
+        private static int GetDefaultHmacLength(
+            string algorithm)
+        {
+            switch (NormalizeAlgorithmName(algorithm))
+            {
+                case "HMACMD5":
+                    return 16;
+
+                case "HMACSHA1":
+                    return 20;
+
+                case "HMACSHA384":
+                    return 48;
+
+                case "HMACSHA512":
+                    return 64;
+
+                case "HMACSHA256":
+                default:
+                    return DefaultHmacLength;
+            }
+        }
+
+        private static string NormalizeAlgorithmName(
+            string value)
+        {
+            return
+                (value ?? string.Empty)
+                    .Replace("-", string.Empty)
+                    .Replace("_", string.Empty)
+                    .Replace(" ", string.Empty)
+                    .Trim()
+                    .ToUpperInvariant();
+        }
+
+        private static CipherMode ParseCipherMode(
+            string value)
+        {
+            CipherMode parsed;
+
+            if (!string.IsNullOrWhiteSpace(value) &&
+                Enum.TryParse(
+                    value,
+                    true,
+                    out parsed))
+            {
+                return parsed;
+            }
+
+            return CipherMode.CBC;
+        }
+
+        private static PaddingMode ParsePaddingMode(
+            string value)
+        {
+            PaddingMode parsed;
+
+            if (!string.IsNullOrWhiteSpace(value) &&
+                Enum.TryParse(
+                    value,
+                    true,
+                    out parsed))
+            {
+                return parsed;
+            }
+
+            return PaddingMode.PKCS7;
+        }
+
+        private static int PositiveOrDefault(
+            int? value,
+            int fallback)
+        {
+            return
+                value.HasValue &&
+                value.Value > 0
+                    ? value.Value
+                    : fallback;
+        }
+
+        private static string ValueOrDefault(
+            string value,
+            string fallback)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? fallback
+                : value.Trim();
+        }
+
+        private static byte[] CloneBytes(
+            byte[] value)
+        {
+            byte[] copy =
+                new byte[value.Length];
+
+            Buffer.BlockCopy(
+                value,
+                0,
+                copy,
+                0,
+                value.Length);
+
+            return copy;
+        }
+
+        private static bool FixedTimeEqualsPrefix(
+            byte[] computed,
+            byte[] received,
+            int length)
+        {
+            if (computed == null ||
+                received == null ||
+                length < 0 ||
+                computed.Length < length ||
+                received.Length != length)
+            {
+                return false;
+            }
+
+            int diff = 0;
+
+            for (int i = 0;
+                 i < length;
+                 i++)
+            {
+                diff |=
+                    computed[i] ^
+                    received[i];
+            }
+
+            return diff == 0;
         }
     }
 }

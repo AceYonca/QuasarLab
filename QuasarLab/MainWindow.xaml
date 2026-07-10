@@ -928,14 +928,6 @@
                                  VerticalScrollBarVisibility="Auto"
                                  Margin="0,0,0,10"/>
 
-                                                <TextBlock Text="Certificate" Style="{StaticResource ProfileLabel}"/>
-                                                <TextBox x:Name="ProfileCertificateBox"
-                                 Text=""
-                                 Style="{StaticResource ProfileTextBox}"
-                                 Height="96"
-                                 TextWrapping="Wrap"
-                                 AcceptsReturn="True"
-                                 VerticalScrollBarVisibility="Auto"/>
                                             </StackPanel>
                                         </Border>
                                     </Grid>

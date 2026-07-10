@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -501,11 +502,15 @@ namespace QuasarLab.Services
 
             conn.SendMessage(BuildIdentification(labConnection));
 
-            bool accepted = await WaitForIdentificationAcceptedAsync(conn);
+            IdentificationOutcome outcome =
+          await WaitForIdentificationAcceptedAsync(conn);
 
-            if (!accepted)
+            if (outcome != IdentificationOutcome.Accepted)
             {
-                labConnection.Status = "Rejected";
+                labConnection.Status =
+                    outcome == IdentificationOutcome.Rejected
+                        ? "Rejected"
+                        : "AuthenticationFailed";
 
                 try
                 {
@@ -516,12 +521,18 @@ namespace QuasarLab.Services
                 }
 
                 LogMessage(
-                    "[" + index + "] Server did not accept client identification.");
+                    "[" + index +
+                    "] Identification failed. Outcome: " +
+                    outcome);
 
-                if (!PerformanceMode || index % UiUpdateEvery == 0)
+                if (!PerformanceMode ||
+                    index % UiUpdateEvery == 0)
                 {
                     RaiseConnectionsChanged();
-                    StatusMessage("Authentication failed");
+
+                    StatusMessage(
+                        "Authentication failed: " +
+                        outcome);
                 }
 
                 return null;
@@ -551,12 +562,145 @@ namespace QuasarLab.Services
 
             return labConnection;
         }
-        private async Task<bool> WaitForIdentificationAcceptedAsync(
-       TlsConnection conn,
-       int timeoutMs = 2500)
+
+        private void LogIdentification(
+    int connectionIndex,
+    ClientIdentification identification)
+        {
+            if (identification == null)
+                return;
+
+            LogMessage(
+                "[" + connectionIndex +
+                "] [HANDSHAKE] Sending ClientIdentification:");
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   Version: " +
+                SafeLogValue(identification.Version));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   OperatingSystem: " +
+                SafeLogValue(identification.OperatingSystem));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   AccountType: " +
+                SafeLogValue(identification.AccountType));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   Country: " +
+                SafeLogValue(identification.Country));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   CountryCode: " +
+                SafeLogValue(identification.CountryCode));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   ImageIndex: " +
+                identification.ImageIndex);
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   Id: " +
+                SafeLogValue(identification.Id));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   Username: " +
+                SafeLogValue(identification.Username));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   PcName: " +
+                SafeLogValue(identification.PcName));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   Tag: " +
+                SafeLogValue(identification.Tag));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   EncryptionKey: " +
+                SafeLogValue(identification.EncryptionKey));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   Signature bytes: " +
+                (identification.Signature != null
+                    ? identification.Signature.Length.ToString()
+                    : "null"));
+
+            LogMessage(
+                "[" + connectionIndex +
+                "]   Signature Base64: " +
+                (identification.Signature != null &&
+                 identification.Signature.Length > 0
+                    ? Convert.ToBase64String(
+                        identification.Signature)
+                    : "<empty>"));
+        }
+
+        private static string SafeLogValue(
+            string value)
+        {
+            return string.IsNullOrEmpty(value)
+                ? "<empty>"
+                : value;
+        }
+
+
+        private ClientIdentification BuildIdentification(
+           LabConnection labConnection)
+        {
+            var identification =
+                new ClientIdentification
+                {
+                    Version = Profile.Version,
+                    OperatingSystem = Profile.OperatingSystem,
+                    AccountType = Profile.AccountType,
+                    Country = Profile.Country,
+                    CountryCode = Profile.CountryCode,
+                    ImageIndex = Profile.ImageIndex,
+                    Id = labConnection.Id,
+                    Username = labConnection.Username,
+                    PcName = labConnection.PcName,
+                    Tag = Profile.Tag
+                };
+
+            if (Profile.Mode == ProfileMode.Release)
+            {
+                identification.EncryptionKey =
+                    Profile.EncryptionKey;
+
+                identification.Signature =
+                    Profile.Signature;
+            }
+
+            LogIdentification(
+                labConnection.Index,
+                identification);
+
+            return identification;
+        }
+
+        private async Task<IdentificationOutcome>
+    WaitForIdentificationAcceptedAsync(
+        TlsConnection conn,
+        int timeoutMs = 2500)
         {
             if (conn == null || !conn.IsConnected)
-                return false;
+            {
+                LogMessage(
+                    "[HANDSHAKE] Connection is not active.");
+
+                return IdentificationOutcome.ConnectionClosed;
+            }
 
             using (var cts =
                 new CancellationTokenSource(timeoutMs))
@@ -577,30 +721,30 @@ namespace QuasarLab.Services
                             "[HANDSHAKE] Expected " +
                             "ClientIdentificationResult but received: " +
                             (message != null
-                                ? message.GetType().Name
+                                ? message.GetType().FullName
                                 : "null"));
 
-                        return false;
+                        return IdentificationOutcome.UnexpectedMessage;
                     }
+
+                    LogMessage(
+                        "[HANDSHAKE] Received " +
+                        "ClientIdentificationResult: Result=" +
+                        result.Result);
 
                     if (!result.Result)
                     {
                         LogMessage(
-                            "[HANDSHAKE] Server rejected " +
+                            "[HANDSHAKE] Server explicitly rejected " +
                             "client identification.");
 
-                        return false;
+                        return IdentificationOutcome.Rejected;
                     }
 
-                    // Don't generate thousands of success-log entries
-                    // during high-volume performance tests.
-                    if (!PerformanceMode)
-                    {
-                        LogMessage(
-                            "[HANDSHAKE] Client identification accepted.");
-                    }
+                    LogMessage(
+                        "[HANDSHAKE] Client identification accepted.");
 
-                    return true;
+                    return IdentificationOutcome.Accepted;
                 }
                 catch (OperationCanceledException)
                 {
@@ -609,61 +753,47 @@ namespace QuasarLab.Services
                         timeoutMs +
                         " ms waiting for identification result.");
 
-                    return false;
+                    return IdentificationOutcome.TimedOut;
                 }
                 catch (IOException ex)
                 {
                     LogMessage(
-                        "[HANDSHAKE] Connection error: " +
+                        "[HANDSHAKE] Connection closed before an " +
+                        "identification result was received: " +
                         ex.Message);
 
-                    return false;
+                    return IdentificationOutcome.ConnectionClosed;
                 }
                 catch (ObjectDisposedException)
                 {
                     LogMessage(
-                        "[HANDSHAKE] Connection was closed " +
-                        "during authentication.");
+                        "[HANDSHAKE] Connection was disposed during authentication.");
 
-                    return false;
+                    return IdentificationOutcome.ConnectionClosed;
                 }
                 catch (Exception ex)
                 {
                     LogMessage(
-                        "[HANDSHAKE] Authentication failed: " +
+                        "[HANDSHAKE] Authentication error: " +
+                        ex.GetType().Name +
+                        ": " +
                         ex.Message);
 
-                    return false;
+                    return IdentificationOutcome.Error;
                 }
             }
         }
-        private ClientIdentification BuildIdentification(LabConnection labConnection)
+
+
+        private enum IdentificationOutcome
         {
-            var identification = new ClientIdentification
-            {
-                Version = Profile.Version,
-                OperatingSystem = Profile.OperatingSystem,
-                AccountType = Profile.AccountType,
-                Country = Profile.Country,
-                CountryCode = Profile.CountryCode,
-                ImageIndex = Profile.ImageIndex,
-
-                Id = labConnection.Id,
-                Username = labConnection.Username,
-                PcName = labConnection.PcName,
-
-                Tag = Profile.Tag
-            };
-
-            if (Profile.Mode == ProfileMode.Release)
-            {
-                identification.EncryptionKey = Profile.EncryptionKey;
-                identification.Signature = Profile.Signature;
-            }
-
-            return identification;
+            Accepted,
+            Rejected,
+            TimedOut,
+            ConnectionClosed,
+            UnexpectedMessage,
+            Error
         }
-
         private async Task ReconnectDisconnectedConnectionsAsync()
         {
             List<LabConnection> disconnected;
@@ -759,12 +889,20 @@ namespace QuasarLab.Services
 
                 AttachPacketTrace(labConnection);
 
-                conn.SendMessage(BuildIdentification(labConnection));
 
-                bool accepted = await WaitForIdentificationAcceptedAsync(conn);
+                conn.SendMessage(
+                   BuildIdentification(labConnection));
 
-                if (!accepted)
+                IdentificationOutcome outcome =
+                    await WaitForIdentificationAcceptedAsync(conn);
+
+                if (outcome != IdentificationOutcome.Accepted)
                 {
+                    labConnection.Status =
+                        outcome == IdentificationOutcome.Rejected
+                            ? "Rejected"
+                            : "AuthenticationFailed";
+
                     try
                     {
                         conn.Dispose();
@@ -774,11 +912,11 @@ namespace QuasarLab.Services
                     }
 
                     labConnection.Connection = null;
-                    labConnection.Status = "Disconnected";
 
                     LogMessage(
-                        "[RECONNECT] Server rejected #" +
-                        labConnection.Index + ".");
+                        "[" + labConnection.Index +
+                        "] Identification failed. Outcome: " +
+                        outcome);
 
                     return false;
                 }
@@ -789,6 +927,7 @@ namespace QuasarLab.Services
                     StartMonitor(labConnection);
 
                 return true;
+           
             }
             catch
             {

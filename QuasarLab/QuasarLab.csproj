@@ -92,6 +92,8 @@
     <Compile Include="QuasarCLI\Protocol\PayloadWriter.cs" />
     <Compile Include="QuasarCLI\Protocol\ProtocolConstants.cs" />
     <Compile Include="QuasarCLI\Protocol\TypeRegistry.cs" />
+    <Compile Include="ImportProfile\QuasarCryptoProfile.cs" />
+    <Compile Include="ImportProfile\QuasarRecoveryProfileImporter.cs" />
     <Page Include="MainWindow.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>

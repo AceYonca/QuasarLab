@@ -418,63 +418,108 @@ namespace QuasarLab
                 AddLog("Apply profile failed: " + ex.Message);
             }
         }
-
-        private void ImportJsonProfileButton_Click(object sender, RoutedEventArgs e)
+private void ImportJsonProfileButton_Click(
+    object sender,
+    RoutedEventArgs e)
         {
-            var dialog = new OpenFileDialog();
-            dialog.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
+            var dialog = new OpenFileDialog
+            {
+                Filter =
+                    "JSON files (*.json)|*.json|" +
+                    "All files (*.*)|*.*"
+            };
 
             if (dialog.ShowDialog() != true)
                 return;
 
             try
             {
-                string json = File.ReadAllText(dialog.FileName);
-                var report = JsonConvert.DeserializeObject<QuasarRecoveryReport>(json);
+                string json =
+                    File.ReadAllText(dialog.FileName);
 
-                if (report == null || report.Settings == null)
+                var defaults =
+                    new QuasarRecoveryImportDefaults
+                    {
+                        OperatingSystem =
+                            ProfileOperatingSystemBox.Text,
+
+                        AccountType =
+                            GetComboText(
+                                ProfileAccountTypeCombo),
+
+                        Country =
+                            ProfileCountryBox.Text,
+
+                        CountryCode =
+                            ProfileCountryCodeBox.Text,
+
+                        ImageIndex =
+                            ParseInt(
+                                ProfileImageIndexBox.Text,
+                                0),
+
+                        PcNameTemplate =
+                            ProfilePcNameBox.Text,
+
+                        UsernameTemplate =
+                            ProfileUsernameBox.Text
+                    };
+
+                ClientProfile importedProfile;
+                string importMessage;
+
+                bool imported =
+                    QuasarRecoveryProfileImporter.TryCreateProfile(
+                        json,
+                        defaults,
+                        out importedProfile,
+                        out importMessage);
+
+                if (!imported)
                 {
-                    AddLog("Invalid recovery JSON.");
+                    AddLog(
+                        "JSON import failed: " +
+                        importMessage);
+
+                    MessageBox.Show(
+                        importMessage,
+                        "Import failed",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+
                     return;
                 }
 
-                string host;
-                int port;
+                _profile =
+                    importedProfile;
 
-                ParseHost(report.Settings.Hosts, out host, out port);
+                LoadProfileIntoUi(
+                    _profile);
 
-                _profile = new ClientProfile
-                {
-                    Mode = ProfileMode.Release,
-                    Name = "Release",
+                _service.Initialize(
+                    _profile);
 
-                    Host = host,
-                    Port = port,
-
-                    Version = report.Settings.Version,
-                    OperatingSystem = ProfileOperatingSystemBox.Text,
-                    AccountType = GetComboText(ProfileAccountTypeCombo),
-                    Country = ProfileCountryBox.Text,
-                    CountryCode = ProfileCountryCodeBox.Text,
-                    ImageIndex = ParseInt(ProfileImageIndexBox.Text, 0),
-                    Tag = GetReleaseTag(report.Settings),
-                    EncryptionKey = report.Settings.EncryptionKey,
-                    Signature = GetReleaseSignature(report.Settings)
-                };
-
-                LoadProfileIntoUi(_profile);
-
-                _service.Initialize(_profile);
                 RefreshProfileUi();
+
                 MarkServerChecking();
 
-                AddLog("Imported release profile from JSON.");
+                AddLog(
+                    importMessage);
             }
             catch (Exception ex)
             {
-                AddLog("JSON import failed: " + ex.Message);
+                AddLog(
+                    "JSON import failed: " +
+                    ex.Message);
+
+                MessageBox.Show(
+                    ex.Message,
+                    "Import failed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
             }
         }
+
 
         private void ProfileModeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
